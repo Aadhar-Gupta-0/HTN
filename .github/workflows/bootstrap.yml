@@ -1,0 +1,139 @@
+name: Import and upgrade HTN
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bootstrap.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Import source and compile token
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch main 'https://github.com/ethglobal/htn2025.git' "$RUNNER_TEMP/upstream"
+          test "$(git -C "$RUNNER_TEMP/upstream" rev-parse HEAD)" = "07a5c7859108cd20408d4432fe6ed7c510430e24"
+          rsync -a --exclude '.git' --exclude '.github' --exclude '.env' "$RUNNER_TEMP/upstream/" ./
+          python - <<'PY'
+          from pathlib import Path
+          Path("contracts/Token.sol").write_text("""// SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.28;
+          
+          import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+          import "@openzeppelin/contracts/access/Ownable.sol";
+          
+          /**
+           * @title NorthToken
+           * @notice Capped ERC-20 demo token with owner-managed minting for hackathon experiments.
+           * @dev Not audited. Never deploy with real-value assets without external review.
+           */
+          contract Token is ERC20, Ownable {
+              uint256 public immutable cap;
+          
+              error CapExceeded();
+              error InvalidCap();
+          
+              constructor(address initialOwner, uint256 initialSupply, uint256 maxSupply)
+                  ERC20("North Token", "NORTH")
+                  Ownable(initialOwner)
+              {
+                  if (maxSupply == 0 || initialSupply > maxSupply) revert InvalidCap();
+                  cap = maxSupply;
+                  _mint(initialOwner, initialSupply);
+              }
+          
+              function mint(address to, uint256 amount) external onlyOwner {
+                  if (amount > cap - totalSupply()) revert CapExceeded();
+                  _mint(to, amount);
+              }
+          }
+          """)
+          Path("ignition/modules/Token.ts").write_text("""import { buildModule } from "@nomicfoundation/hardhat-ignition/modules";
+          
+          export default buildModule("Token", (m) => {
+            const owner = m.getAccount(0);
+            const initialSupply = m.getParameter("initialSupply", 1000000n * 10n ** 18n);
+            const maxSupply = m.getParameter("maxSupply", 10000000n * 10n ** 18n);
+            const token = m.contract("Token", [owner, initialSupply, maxSupply]);
+            return { token };
+          });
+          """)
+          Path("scripts/mint.ts").write_text("""import { network } from "hardhat";
+          import { isAddress, parseUnits } from "viem";
+          
+          const tokenAddress = process.env.TOKEN_ADDRESS;
+          const recipient = process.env.MINT_TO;
+          const rawAmount = process.env.MINT_AMOUNT ?? "1";
+          if (!tokenAddress || !isAddress(tokenAddress) || !recipient || !isAddress(recipient)) {
+            throw new Error("Set TOKEN_ADDRESS and MINT_TO to valid Ethereum addresses.");
+          }
+          if (!/^(0|[1-9]\\d*)(\\.\\d{1,18})?$/.test(rawAmount) || Number(rawAmount) <= 0) {
+            throw new Error("MINT_AMOUNT must be a positive decimal with <=18 fractional digits.");
+          }
+          const { viem } = await network.connect({ network: process.env.HARDHAT_NETWORK || "hardhatMainnet", chainType: "l1" });
+          const publicClient = await viem.getPublicClient();
+          const [walletClient] = await viem.getWalletClients();
+          const token = await viem.getContractAt("Token", tokenAddress, {
+            client: { public: publicClient, wallet: walletClient },
+          });
+          const amount = parseUnits(rawAmount, await token.read.decimals());
+          const hash = await token.write.mint([recipient, amount]);
+          await publicClient.waitForTransactionReceipt({ hash });
+          console.log("Mint transaction:", hash);
+          """)
+          Path("README.md").write_text("""# HTN — Capped ERC-20 Token Lab
+          
+          A Hardhat 3 / Viem smart-contract workshop with a **real ERC-20 implementation**, explicit owner controls, a supply cap, and safer, configurable deployment scripts.
+          
+          ## Improvements
+          - OpenZeppelin ERC-20 rather than an empty Token placeholder.
+          - Initial supply minted to an explicit deployer owner on construction.
+          - Owner-only mint operation that cannot exceed an immutable supply cap.
+          - Ignition module parameters for supply and cap.
+          - Mint script reads target and recipient addresses from environment variables and validates them.
+          
+          ## Local verification
+          \`\`\`bash
+          npm ci
+          npm run build
+          \`\`\`
+          
+          ## Development
+          Run the Hardhat local simulation before connecting a testnet. \`npm run deploy\` targets Sepolia and can spend testnet ETH; do not run without reviewing parameters, network, and accounts. Never commit private keys.
+          
+          ## Safety
+          **Educational smart contracts, not audited.** No real funds or production token launches until independent audit, test coverage, deployment scripts, and access controls have been reviewed.
+          
+          This edition builds on the Hardhat workshop starter from [ethglobal/htn2025](https://github.com/ethglobal/htn2025), independently maintained as \`Aadhar-Gupta-0/HTN\`.
+          """)
+          Path(".github").mkdir(exist_ok=True)
+          Path(".github/workflows").mkdir(parents=True,exist_ok=True)
+          Path(".github/workflows/ci.yml").write_text("""name: Compile HTN token
+          on: [push, pull_request]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-node@v4
+                  with:
+                    node-version: '22'
+                - run: npm ci
+                - run: npm run build
+          """)
+          
+          PY
+          npm ci --no-audit --no-fund
+          npm run build
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Upgrade HTN to capped ERC-20 demo with configurable minting'
+          git push origin HEAD:main
